@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <ctype.h>
 #include <errno.h>
 #include <assert.h>
@@ -55,6 +56,7 @@ connect_t true___xnet_connect;
 #endif
 
 close_t true_close;
+close_range_t true_close_range;
 connect_t true_connect;
 gethostbyname_t true_gethostbyname;
 getaddrinfo_t true_getaddrinfo;
@@ -85,13 +87,14 @@ static int init_l = 0;
 
 static void get_chain_data(proxy_data * pd, unsigned int *proxy_count, chain_type * ct);
 
-static void* load_sym(char* symname, void* proxyfunc) {
-
+static void* load_sym(char* symname, void* proxyfunc, int is_mandatory) {
 	void *funcptr = dlsym(RTLD_NEXT, symname);
 
-	if(!funcptr) {
+	if(is_mandatory && !funcptr) {
 		fprintf(stderr, "Cannot load symbol '%s' %s\n", symname, dlerror());
 		exit(1);
+	} else if (!funcptr) {
+		return funcptr;
 	} else {
 		PDEBUG("loaded symbol '%s'" " real addr %p  wrapped addr %p\n", symname, funcptr, proxyfunc);
 	}
@@ -104,28 +107,23 @@ static void* load_sym(char* symname, void* proxyfunc) {
 
 #define INIT() init_lib_wrapper(__FUNCTION__)
 
-#define SETUP_SYM(X) do { if (! true_ ## X ) true_ ## X = load_sym( # X, X ); } while(0)
 
 #include "allocator_thread.h"
 
 const char *proxychains_get_version(void);
 
-static void setup_hooks(void) {
-	SETUP_SYM(connect);
-	SETUP_SYM(sendto);
-	SETUP_SYM(gethostbyname);
-	SETUP_SYM(getaddrinfo);
-	SETUP_SYM(freeaddrinfo);
-	SETUP_SYM(gethostbyaddr);
-	SETUP_SYM(getnameinfo);
-#ifdef IS_SOLARIS
-	SETUP_SYM(__xnet_connect);
-#endif
-	SETUP_SYM(close);
-}
+static void setup_hooks(void);
 
+typedef struct {
+	unsigned int first, last, flags;
+} close_range_args_t;
+
+/* If there is some `close` or `close_range` system call before do_init, 
+   we buffer it, and actually execute them in do_init. */
 static int close_fds[16];
 static int close_fds_cnt = 0;
+static close_range_args_t close_range_buffer[16];
+static int close_range_buffer_cnt = 0;
 
 static unsigned get_rand_seed(void) {
 #ifdef HAVE_CLOCK_GETTIME
@@ -150,6 +148,10 @@ static void do_init(void) {
 	setup_hooks();
 
 	while(close_fds_cnt) true_close(close_fds[--close_fds_cnt]);
+	while(close_range_buffer_cnt) {
+		int i = --close_range_buffer_cnt;
+		true_close_range(close_range_buffer[i].first, close_range_buffer[i].last, close_range_buffer[i].flags);
+	}
 	init_l = 1;
 
 	rdns_init(proxychains_resolver);
@@ -282,8 +284,7 @@ static void get_chain_data(proxy_data * pd, unsigned int *proxy_count, chain_typ
 	int count = 0, port_n = 0, list = 0;
 	char buf[1024], type[1024], host[1024], user[1024];
 	char *buff, *env, *p;
-	char local_in_addr_port[32];
-	char local_in_addr[32], local_in_port[32], local_netmask[32];
+	char local_addr_port[64], local_addr[64], local_netmask[32];
 	char dnat_orig_addr_port[32], dnat_new_addr_port[32];
 	char dnat_orig_addr[32], dnat_orig_port[32], dnat_new_addr[32], dnat_new_port[32];
 	char rdnsd_addr[32], rdnsd_port[8];
@@ -398,41 +399,75 @@ inv_host:
 						exit(1);
 					}
 				} else if(STR_STARTSWITH(buff, "localnet")) {
-					if(sscanf(buff, "%s %21[^/]/%15s", user, local_in_addr_port, local_netmask) < 3) {
+					char colon, extra, right_bracket[2];
+					unsigned short local_port = 0, local_prefix;
+					int local_family, n, valid;
+					if(sscanf(buff, "%s %53[^/]/%15s%c", user, local_addr_port, local_netmask, &extra) != 3) {
 						fprintf(stderr, "localnet format error");
 						exit(1);
 					}
-					/* clean previously used buffer */
-					memset(local_in_port, 0, sizeof(local_in_port) / sizeof(local_in_port[0]));
-
-					if(sscanf(local_in_addr_port, "%15[^:]:%5s", local_in_addr, local_in_port) < 2) {
-						PDEBUG("added localnet: netaddr=%s, netmask=%s\n",
-						       local_in_addr, local_netmask);
+					p = strchr(local_addr_port, ':');
+					if(!p || p == strrchr(local_addr_port, ':')) {
+						local_family = AF_INET;
+						n = sscanf(local_addr_port, "%15[^:]%c%5hu%c", local_addr, &colon, &local_port, &extra);
+						valid = n == 1 || (n == 3 && colon == ':');
+					} else if(local_addr_port[0] == '[') {
+						local_family = AF_INET6;
+						n = sscanf(local_addr_port, "[%45[^][]%1[]]%c%5hu%c", local_addr, right_bracket, &colon, &local_port, &extra);
+						valid = n == 2 || (n == 4 && colon == ':');
 					} else {
-						PDEBUG("added localnet: netaddr=%s, port=%s, netmask=%s\n",
-						       local_in_addr, local_in_port, local_netmask);
+						local_family = AF_INET6;
+						valid = sscanf(local_addr_port, "%45[^][]%c", local_addr, &extra) == 1;
+					}
+					if(!valid) {
+						fprintf(stderr, "localnet address or port error\n");
+						exit(1);
+					}
+					if(local_port) {
+						PDEBUG("added localnet: netaddr=%s, port=%u, netmask=%s\n",
+						       local_addr, local_port, local_netmask);
+					} else {
+						PDEBUG("added localnet: netaddr=%s, netmask=%s\n",
+						       local_addr, local_netmask);
 					}
 					if(num_localnet_addr < MAX_LOCALNET) {
-						int error;
-						error =
-						    inet_pton(AF_INET, local_in_addr,
-							      &localnet_addr[num_localnet_addr].in_addr);
-						if(error <= 0) {
+						localnet_addr[num_localnet_addr].family = local_family;
+						localnet_addr[num_localnet_addr].port = local_port;
+						valid = 0;
+						if (local_family == AF_INET) {
+							valid =
+							    inet_pton(local_family, local_addr,
+							              &localnet_addr[num_localnet_addr].in_addr) > 0;
+						} else if(local_family == AF_INET6) {
+							valid =
+							    inet_pton(local_family, local_addr,
+							              &localnet_addr[num_localnet_addr].in6_addr) > 0;
+						}
+						if(!valid) {
 							fprintf(stderr, "localnet address error\n");
 							exit(1);
 						}
-						error =
-						    inet_pton(AF_INET, local_netmask,
-							      &localnet_addr[num_localnet_addr].netmask);
-						if(error <= 0) {
+						if(local_family == AF_INET && strchr(local_netmask, '.')) {
+							valid =
+							    inet_pton(local_family, local_netmask,
+							              &localnet_addr[num_localnet_addr].in_mask) > 0;
+						} else {
+							valid = sscanf(local_netmask, "%hu%c", &local_prefix, &extra) == 1;
+							if (valid) {
+								if(local_family == AF_INET && local_prefix <= 32) {
+									localnet_addr[num_localnet_addr].in_mask.s_addr =
+										htonl(0xFFFFFFFFu << (32u - local_prefix));
+								} else if(local_family == AF_INET6 && local_prefix <= 128) {
+									localnet_addr[num_localnet_addr].in6_prefix =
+										local_prefix;
+								} else {
+									valid = 0;
+								}
+							}
+						}
+						if(!valid) {
 							fprintf(stderr, "localnet netmask error\n");
 							exit(1);
-						}
-						if(local_in_port[0]) {
-							localnet_addr[num_localnet_addr].port =
-							    (short) atoi(local_in_port);
-						} else {
-							localnet_addr[num_localnet_addr].port = 0;
 						}
 						++num_localnet_addr;
 					} else {
@@ -537,7 +572,14 @@ inv_host:
 
 /*******  HOOK FUNCTIONS  *******/
 
-int close(int fd) {
+#define EXPAND( args...) args
+#ifdef MONTEREY_HOOKING
+#define HOOKFUNC(R, N, args...) R pxcng_ ## N ( EXPAND(args) )
+#else
+#define HOOKFUNC(R, N, args...) R N ( EXPAND(args) )
+#endif
+
+HOOKFUNC(int, close, int fd) {
 	if(!init_l) {
 		if(close_fds_cnt>=(sizeof close_fds/sizeof close_fds[0])) goto err;
 		close_fds[close_fds_cnt++] = fd;
@@ -558,7 +600,71 @@ int close(int fd) {
 static int is_v4inv6(const struct in6_addr *a) {
 	return !memcmp(a->s6_addr, "\0\0\0\0\0\0\0\0\0\0\xff\xff", 12);
 }
-int connect(int sock, const struct sockaddr *addr, unsigned int len) {
+
+static void intsort(int *a, int n) {
+	int i, j, s;
+	for(i=0; i<n; ++i)
+		for(j=i+1; j<n; ++j)
+			if(a[j] < a[i]) {
+				s = a[i];
+				a[i] = a[j];
+				a[j] = s;
+			}
+}
+
+/* Warning: Linux manual says the third arg is `unsigned int`, but unistd.h says `int`. */
+HOOKFUNC(int, close_range, unsigned first, unsigned last, int flags) {
+	if(true_close_range == NULL) {
+		fprintf(stderr, "Calling close_range, but this platform does not provide this system call. ");
+		return -1;
+	}
+	if(!init_l) {
+		/* push back to cache, and delay the execution. */
+		if(close_range_buffer_cnt >= (sizeof close_range_buffer / sizeof close_range_buffer[0])) {
+			errno = ENOMEM;
+			return -1;
+		}
+		int i = close_range_buffer_cnt++;
+		close_range_buffer[i].first = first;
+		close_range_buffer[i].last = last;
+		close_range_buffer[i].flags = flags;
+		return errno = 0;
+	}
+	if(proxychains_resolver != DNSLF_RDNS_THREAD) return true_close_range(first, last, flags);
+
+	/* prevent rude programs (like ssh) from closing our pipes */
+	int res = 0, uerrno = 0, i;
+	int protected_fds[] = {req_pipefd[0], req_pipefd[1], resp_pipefd[0], resp_pipefd[1]};
+	intsort(protected_fds, 4);
+	/* We are skipping protected_fds while calling true_close_range()
+	 * If protected_fds cut the range into some sub-ranges, we close sub-ranges BEFORE cut point in the loop. 
+	 * [first, cut1-1] , [cut1+1, cut2-1] , [cut2+1, cut3-1]
+	 * Finally, we delete the remaining sub-range, outside the loop. [cut3+1, tail]
+	 */
+	int next_fd_to_close = first;
+	for(i = 0; i < 4; ++i) {
+		if(protected_fds[i] < first || protected_fds[i] > last)
+			continue;
+		int prev = (i == 0 || protected_fds[i-1] < first) ? first : protected_fds[i-1]+1;
+		if(prev != protected_fds[i]) {
+			if(-1 == true_close_range(prev, protected_fds[i]-1, flags)) {
+				res = -1;
+				uerrno = errno;
+			}
+		}
+		next_fd_to_close = protected_fds[i]+1;
+	}
+	if(next_fd_to_close <= last) {
+		if(-1 == true_close_range(next_fd_to_close, last, flags)) {
+			res = -1;
+			uerrno = errno;
+		}
+	}
+	errno = uerrno;
+	return res;
+}
+
+HOOKFUNC(int, connect, int sock, const struct sockaddr *addr, unsigned int len) {
 	INIT();
 	PFUNC();
 
@@ -621,14 +727,24 @@ int connect(int sock, const struct sockaddr *addr, unsigned int len) {
 			port = dnat->new_port;
 	}
 
-	if (!v6) for(i = 0; i < num_localnet_addr && !remote_dns_connect; i++) {
-		if((localnet_addr[i].in_addr.s_addr & localnet_addr[i].netmask.s_addr)
-		   == (p_addr_in->s_addr & localnet_addr[i].netmask.s_addr)) {
-			if(!localnet_addr[i].port || localnet_addr[i].port == port) {
-				PDEBUG("accessing localnet using true_connect\n");
-				return true_connect(sock, addr, len);
-			}
+	for(i = 0; i < num_localnet_addr && !remote_dns_connect; i++) {
+		if (localnet_addr[i].port && localnet_addr[i].port != port)
+			continue;
+		if (localnet_addr[i].family != (v6 ? AF_INET6 : AF_INET))
+			continue;
+		if (v6) {
+			size_t prefix_bytes = localnet_addr[i].in6_prefix / CHAR_BIT;
+			size_t prefix_bits = localnet_addr[i].in6_prefix % CHAR_BIT;
+			if (prefix_bytes && memcmp(p_addr_in6->s6_addr, localnet_addr[i].in6_addr.s6_addr, prefix_bytes) != 0)
+				continue;
+			if (prefix_bits && (p_addr_in6->s6_addr[prefix_bytes] ^ localnet_addr[i].in6_addr.s6_addr[prefix_bytes]) >> (CHAR_BIT - prefix_bits))
+				continue;
+		} else {
+			if((p_addr_in->s_addr ^ localnet_addr[i].in_addr.s_addr) & localnet_addr[i].in_mask.s_addr)
+				continue;
 		}
+		PDEBUG("accessing localnet using true_connect\n");
+		return true_connect(sock, addr, len);
 	}
 
 	flags = fcntl(sock, F_GETFL, 0);
@@ -649,13 +765,13 @@ int connect(int sock, const struct sockaddr *addr, unsigned int len) {
 }
 
 #ifdef IS_SOLARIS
-int __xnet_connect(int sock, const struct sockaddr *addr, unsigned int len) {
+HOOKFUNC(int, __xnet_connect, int sock, const struct sockaddr *addr, unsigned int len)
 	return connect(sock, addr, len);
 }
 #endif
 
 static struct gethostbyname_data ghbndata;
-struct hostent *gethostbyname(const char *name) {
+HOOKFUNC(struct hostent*, gethostbyname, const char *name) {
 	INIT();
 	PDEBUG("gethostbyname: %s\n", name);
 
@@ -669,7 +785,7 @@ struct hostent *gethostbyname(const char *name) {
 	return NULL;
 }
 
-int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res) {
+HOOKFUNC(int, getaddrinfo, const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res) {
 	INIT();
 	PDEBUG("getaddrinfo: %s %s\n", node ? node : "null", service ? service : "null");
 
@@ -679,7 +795,7 @@ int getaddrinfo(const char *node, const char *service, const struct addrinfo *hi
 		return true_getaddrinfo(node, service, hints, res);
 }
 
-void freeaddrinfo(struct addrinfo *res) {
+HOOKFUNC(void, freeaddrinfo, struct addrinfo *res) {
 	INIT();
 	PDEBUG("freeaddrinfo %p \n", (void *) res);
 
@@ -689,9 +805,9 @@ void freeaddrinfo(struct addrinfo *res) {
 		proxy_freeaddrinfo(res);
 }
 
-int pc_getnameinfo(const struct sockaddr *sa, socklen_t salen,
-	           char *host, socklen_t hostlen, char *serv,
-	           socklen_t servlen, int flags)
+HOOKFUNC(int, getnameinfo, const struct sockaddr *sa, socklen_t salen,
+	           char *host, GN_NODELEN_T hostlen, char *serv,
+	           GN_SERVLEN_T servlen, GN_FLAGS_T flags)
 {
 	INIT();
 	PFUNC();
@@ -733,7 +849,7 @@ int pc_getnameinfo(const struct sockaddr *sa, socklen_t salen,
 	return 0;
 }
 
-struct hostent *gethostbyaddr(const void *addr, socklen_t len, int type) {
+HOOKFUNC(struct hostent*, gethostbyaddr, const void *addr, socklen_t len, int type) {
 	INIT();
 	PDEBUG("TODO: proper gethostbyaddr hook\n");
 
@@ -769,7 +885,7 @@ struct hostent *gethostbyaddr(const void *addr, socklen_t len, int type) {
 #   define MSG_FASTOPEN 0x20000000
 #endif
 
-ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
+HOOKFUNC(ssize_t, sendto, int sockfd, const void *buf, size_t len, int flags,
 	       const struct sockaddr *dest_addr, socklen_t addrlen) {
 	INIT();
 	PFUNC();
@@ -783,3 +899,45 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
 	}
 	return true_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
 }
+
+#ifdef MONTEREY_HOOKING
+#define SETUP_SYM(X) do { if (! true_ ## X ) true_ ## X = &X; } while(0)
+#define SETUP_SYM_OPTIONAL(X)
+#else
+#define SETUP_SYM_IMPL(X, IS_MANDATORY) do { if (! true_ ## X ) true_ ## X = load_sym( # X, X, IS_MANDATORY ); } while(0)
+#define SETUP_SYM(X) SETUP_SYM_IMPL(X, 1)
+#define SETUP_SYM_OPTIONAL(X) SETUP_SYM_IMPL(X, 0)
+#endif
+
+static void setup_hooks(void) {
+	SETUP_SYM(connect);
+	SETUP_SYM(sendto);
+	SETUP_SYM(gethostbyname);
+	SETUP_SYM(getaddrinfo);
+	SETUP_SYM(freeaddrinfo);
+	SETUP_SYM(gethostbyaddr);
+	SETUP_SYM(getnameinfo);
+#ifdef IS_SOLARIS
+	SETUP_SYM(__xnet_connect);
+#endif
+	SETUP_SYM(close);
+	SETUP_SYM_OPTIONAL(close_range);
+}
+
+#ifdef MONTEREY_HOOKING
+
+#define DYLD_INTERPOSE(_replacement,_replacee) \
+   __attribute__((used)) static struct{ const void* replacement; const void* replacee; } _interpose_##_replacee \
+   __attribute__((section ("__DATA,__interpose"))) = { (const void*)(unsigned long)&_replacement, (const void*)(unsigned long)&_replacee };
+#define DYLD_HOOK(F) DYLD_INTERPOSE(pxcng_ ## F, F)
+
+DYLD_HOOK(connect);
+DYLD_HOOK(sendto);
+DYLD_HOOK(gethostbyname);
+DYLD_HOOK(getaddrinfo);
+DYLD_HOOK(freeaddrinfo);
+DYLD_HOOK(gethostbyaddr);
+DYLD_HOOK(getnameinfo);
+DYLD_HOOK(close);
+
+#endif

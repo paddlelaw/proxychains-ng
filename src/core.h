@@ -65,8 +65,18 @@ typedef enum {
 } select_type;
 
 typedef struct {
-	struct in_addr in_addr, netmask;
+	sa_family_t family;
 	unsigned short port;
+	union {
+		struct {
+			struct in_addr in_addr;
+			struct in_addr in_mask;
+		};
+		struct {
+			struct in6_addr in6_addr;
+			unsigned char in6_prefix;
+		};
+	};
 } localaddr_arg;
 
 typedef struct {
@@ -90,6 +100,7 @@ int connect_proxy_chain (int sock, ip_type target_ip, unsigned short target_port
 void proxychains_write_log(char *str, ...);
 
 typedef int (*close_t)(int);
+typedef int (*close_range_t)(unsigned, unsigned, int);
 typedef int (*connect_t)(int, const struct sockaddr *, socklen_t);
 typedef struct hostent* (*gethostbyname_t)(const char *);
 typedef int (*freeaddrinfo_t)(struct addrinfo *);
@@ -99,7 +110,7 @@ typedef int (*getaddrinfo_t)(const char *, const char *, const struct addrinfo *
 			     struct addrinfo **);
 
 typedef int (*getnameinfo_t) (const struct sockaddr *, socklen_t, char *, 
-			      socklen_t, char *, socklen_t, int);
+			      GN_NODELEN_T, char *, GN_SERVLEN_T, GN_FLAGS_T);
 
 typedef ssize_t (*sendto_t) (int sockfd, const void *buf, size_t len, int flags,
 			     const struct sockaddr *dest_addr, socklen_t addrlen);

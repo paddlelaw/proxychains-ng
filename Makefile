@@ -11,7 +11,8 @@ bindir = $(exec_prefix)/bin
 prefix = /usr/local/
 includedir = $(prefix)/include
 libdir = $(prefix)/lib
-sysconfdir=$(prefix)/etc
+sysconfdir = $(prefix)/etc
+zshcompletiondir = $(prefix)/share/zsh/site_functions
 
 OBJS = src/common.o src/main.o
 
@@ -19,7 +20,7 @@ DOBJS = src/daemon/hsearch.o \
         src/daemon/sblist.o src/daemon/sblist_delete.o \
         src/daemon/daemon.o src/daemon/udpserver.o
 
-LOBJS = src/nameinfo.o src/version.o \
+LOBJS = src/version.o \
         src/core.o src/common.o src/libproxychains.o \
         src/allocator_thread.o src/rdns.o \
         src/hostsreader.o src/hash.o src/debug.o
@@ -29,7 +30,6 @@ GENH = src/version.h
 
 CFLAGS  += -Wall -O0 -g -std=c99 -D_GNU_SOURCE -pipe
 NO_AS_NEEDED = -Wl,--no-as-needed
-LIBDL   = -ldl
 LDFLAGS = -fPIC $(NO_AS_NEEDED) $(LIBDL) $(PTHREAD)
 INC     = 
 PIC     = -fPIC
@@ -49,6 +49,7 @@ PXCHAINS = proxychains4
 PXCHAINS_D = proxychains4-daemon
 ALL_TOOLS = $(PXCHAINS) $(PXCHAINS_D)
 ALL_CONFIGS = src/proxychains.conf
+ZSH_COMPLETION = completions/_proxychains4
 
 -include config.mak
 
@@ -69,9 +70,13 @@ $(DESTDIR)$(libdir)/%: %
 $(DESTDIR)$(sysconfdir)/%: src/%
 	$(INSTALL) -D -m 644 $< $@
 
+$(DESTDIR)$(zshcompletiondir)/%: completions/%
+	$(INSTALL) -D -m 644 $< $@
+
 install-libs: $(ALL_LIBS:%=$(DESTDIR)$(libdir)/%)
 install-tools: $(ALL_TOOLS:%=$(DESTDIR)$(bindir)/%)
 install-config: $(ALL_CONFIGS:src/%=$(DESTDIR)$(sysconfdir)/%)
+install-zsh-completion: $(ZSH_COMPLETION:completions/%=$(DESTDIR)$(zshcompletiondir)/%)
 
 clean:
 	rm -f $(ALL_LIBS)
@@ -98,4 +103,4 @@ $(PXCHAINS_D): $(DOBJS)
 	$(CC) $^ $(USER_LDFLAGS) -o $@
 
 
-.PHONY: all clean install install-config install-libs install-tools
+.PHONY: all clean install install-config install-libs install-tools install-zsh-completion
